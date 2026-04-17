@@ -860,20 +860,112 @@ This lab provides the practical foundation for all four AWS associate and profes
 
 ---
 
-## Cost control
+## Cost breakdown by phase
 
-Every phase that provisions AWS resources includes a teardown section. The estimated cost per phase assumes resources are destroyed when not in active use.
+All prices are AWS on-demand rates in `us-east-1` as of 2026. Costs assume resources run 24 hours — destroy at end of each session.
 
-| Phase | Resources running | Estimated cost/day |
+### Resource pricing reference
+
+| Resource | Size | $/hour | $/day |
+|---|---|---|---|
+| NAT Gateway | — | $0.045 each | $1.08 each |
+| EC2 | t3.small | $0.021 | $0.50 |
+| EC2 | t3.medium | $0.042 | $1.00 |
+| RDS PostgreSQL | db.t3.small Multi-AZ | $0.068 | $1.63 |
+| RDS PostgreSQL | db.t3.micro Single-AZ | $0.017 | $0.41 |
+| ElastiCache Redis | cache.t3.micro | $0.017 | $0.41 |
+| ALB | — | $0.008 + LCU | ~$0.25 |
+| ECS Fargate | 0.5 vCPU / 1 GB × 2 tasks | — | $1.19 |
+| EKS control plane | — | $0.100 | $2.40 |
+| EC2 node | t3.medium × 2 | $0.042 each | $2.00 |
+| CloudWatch Logs | ~0.5 GB/day ingested | — | ~$0.30 |
+| Managed Grafana | 1 active user | — | $0.30 |
+| GuardDuty | small account (post-trial) | — | ~$1.00 |
+| WAF Web ACL | — | — | $0.17 |
+| AWS Config | ~50 resources | — | ~$0.20 |
+
+---
+
+### Phase-by-phase cost table
+
+| Phase | Resources added | Resources removed | Net $/day | Cumulative $/day |
+|---|---|---|---|---|
+| **0** | None — local Docker only | — | $0 | $0 |
+| **1** | VPC, 2× NAT GW, S3 bucket, DynamoDB lock | — | +$2.20 | **$2.20** |
+| **2** | 2× EC2 t3.small, RDS Multi-AZ, ElastiCache, ALB, Route 53 | — | +$3.90 | **$6.10** |
+| **3** | ECS Fargate ×2 (0.5 vCPU/1 GB), ECR | 2× EC2 | +$0.20 | **$6.30** |
+| **4** | ECR image storage (~5 images) | — | +$0.05 | **$6.35** |
+| **5** | S3 assets bucket, CloudFront distribution | — | +$0.05 | **$6.40** |
+| **6** | SQS ×3, SNS topic, DLQ ×3 | — | ~$0 (free tier) | **$6.40** |
+| **7** | Lambda functions, EventBridge Scheduler | — | ~$0 (free tier) | **$6.40** |
+| **8** | Cognito User Pool | — | ~$0 (<50K MAU free) | **$6.40** |
+| **9** | EKS control plane, 2× t3.medium nodes | ECS Fargate ×2 | +$3.21 | **$9.60** |
+| **10** | CloudWatch Logs, Managed Prometheus, Managed Grafana | — | +$0.70 | **$10.30** |
+| **11** | GuardDuty¹, Config, WAF, Security Hub, Inspector, Secrets Manager | — | +$1.65 | **$11.95** |
+| **12** | ×3 environments (dev + staging + prod) + shared services | — | +$22 | **~$34** |
+
+¹ GuardDuty has a **30-day free trial** per account. Phase 11 will cost ~$10.95/day during the trial, ~$11.95/day after.
+
+---
+
+### Phase 12 breakdown (multi-account)
+
+Phase 12 is the only phase where costs jump significantly. Here is the per-account breakdown:
+
+| Account | Key resources | $/day |
 |---|---|---|
-| 1 | VPC, NAT gateway | $1 |
-| 2 | EC2 × 2, RDS Multi-AZ, ElastiCache | $8–12 |
-| 3 | ECS Fargate × 2, RDS, ElastiCache | $5–8 |
-| 4–8 | ECS/Lambda, RDS, ElastiCache, SQS | $6–10 |
-| 9+ | EKS cluster + nodes, RDS, others | $8–15 |
+| **dev** | 1 NAT GW, EKS, 1× t3.small node, RDS Single-AZ | ~$5 |
+| **staging** | 2 NAT GW, EKS, 2× t3.medium nodes, RDS Multi-AZ, ElastiCache | ~$10 |
+| **prod** | 2 NAT GW, EKS, 2× t3.medium nodes, RDS Multi-AZ, ElastiCache, WAF | ~$11 |
+| **shared** (audit + log archive) | GuardDuty, Config, Security Hub, CloudTrail (3 accounts) | ~$5 |
+| **Total** | | **~$31–35/day** |
+
+> Run Phase 12 in sprint mode — provision everything, complete the capstone scenario, destroy within 2–3 days. A full Phase 12 run costs ~$70–100.
+
+---
+
+### Monthly cost if you never destroy
+
+This is what you would pay if resources stayed running all month — use this as the upper bound when setting billing alerts.
+
+| Phase | Resources alive | Monthly cost |
+|---|---|---|
+| 1 | VPC + NAT GW | ~$66 |
+| 2 | + EC2, RDS, ElastiCache, ALB | ~$183 |
+| 3–8 | + ECS, S3, CloudFront, Lambda | ~$192 |
+| 9 | + EKS, nodes (ECS removed) | ~$288 |
+| 10 | + observability stack | ~$309 |
+| 11 | + security stack | ~$358 |
+| 12 | 3× environments | ~$1,000 |
+
+---
+
+### Cost control checklist
+
+Set these up before starting Phase 1:
+
+```bash
+# 1. Create a billing alert — pages you before costs spiral
+aws budgets create-budget \
+  --account-id $(aws sts get-caller-identity --query Account --output text) \
+  --budget file://budget.json \
+  --notifications-with-subscribers file://notifications.json
+
+# 2. Tag every resource — makes Cost Explorer useful
+# Every Terraform resource should have:
+# tags = { Project = "orderflow", Phase = "2", Environment = "dev" }
+
+# 3. Destroy when done with a phase
+cd phase-X-*/terraform
+terraform destroy -auto-approve
+```
+
+**The single most expensive resource to leave running:** NAT Gateway. Two NAT gateways cost $1,620/year doing nothing. Always destroy them when not actively working.
+
+**Cheapest multi-day option:** After completing each phase, keep only RDS running (cheapest instance with a final snapshot) and destroy everything else. Restore from snapshot at the start of the next session.
 
 > Always run `terraform destroy` when you finish a phase and are not actively working on the next.
-> Set a **billing alert** in AWS Budgets for $50/month to catch runaway resources.
+> Set a **billing alert** in AWS Budgets at $50/month as a hard floor — increase it only when you intentionally start a new phase.
 
 ---
 
