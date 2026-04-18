@@ -2,40 +2,31 @@
 
 > **AWS services introduced:** EKS, ALB Ingress Controller, EBS CSI Driver, IRSA, Karpenter | **Daily cost:** ~$9.60/day
 
-## Objective
+---
 
-Move long-running API services from ECS to Kubernetes. ECS works for a single team — EKS is the answer when multiple teams need namespace isolation, RBAC, NetworkPolicies, and a standard deployment model.
+## AWS services introduced
 
-## AWS services
+| Service | What it does | Why we need it |
+|---|---|---|
+| **EKS** | Managed Kubernetes | Kubernetes control plane managed by AWS |
+| **EKS Fargate profiles** | Serverless Kubernetes nodes | Run pods without managing EC2 node groups |
+| **ALB Ingress Controller** | Kubernetes ingress via ALB | Routes external traffic to Kubernetes services |
+| **EBS CSI Driver** | Persistent volumes on EKS | Provision EBS volumes for stateful workloads |
+| **AWS Load Balancer Controller** | ALB/NLB from Kubernetes | Manages ALB resources from Kubernetes manifests |
 
-| Service | Why we need it |
-|---|---|
-| **EKS** | Managed Kubernetes control plane |
-| **AWS Load Balancer Controller** | Creates ALBs from Kubernetes `Ingress` resources |
-| **EBS CSI Driver** | Provisions EBS persistent volumes for stateful workloads |
-| **IRSA** | Binds Kubernetes ServiceAccounts to IAM roles (no shared credentials) |
-| **Karpenter** | Provisions the right EC2 instance type for each workload automatically |
+## The problem
 
-## Terraform structure
+OrderFlow has grown. What started as one team with one service is now four teams working on five services. ECS is operationally simple but does not scale well for multi-team environments:
+- No namespace-based isolation between teams
+- No standard way to define service-to-service policies
+- Each new service requires manual ECS infrastructure setup
+- No self-service deployment without IAM changes
 
-```
-terraform/
-├── eks_cluster.tf   # EKS cluster + managed node group
-├── irsa.tf          # OIDC provider + IAM roles per service
-├── karpenter.tf     # Karpenter installation + node class
-└── variables.tf
-```
-
-## Helm charts
-
-```
-charts/
-├── orderflow-orders/      # Orders API Helm chart
-├── orderflow-inventory/   # Inventory service Helm chart
-└── orderflow-warehouse/   # Warehouse notifier Helm chart
-```
+Kubernetes solves the multi-team problem with namespaces, RBAC, NetworkPolicies, and a standard deployment model that any engineer can learn once and apply everywhere.
 
 ## What moves to EKS
+
+Not everything. Lambda functions stay Lambda. RDS stays RDS. S3 stays S3. What moves is the **long-running API services** that need the Kubernetes feature set:
 
 | Workload | Before | After |
 |---|---|---|
@@ -43,32 +34,32 @@ charts/
 | Inventory Service | ECS Service | EKS Deployment |
 | Warehouse Notifier | ECS Service | EKS Deployment |
 | Report Generator | Lambda | Lambda (unchanged) |
+| Email Sender | Lambda | Lambda (unchanged) |
 | Static Assets | CloudFront/S3 | CloudFront/S3 (unchanged) |
-
-## Key concept: IRSA
-
-```
-Pod (ServiceAccount: orders-api)
-  → AssumeRoleWithWebIdentity
-      → EKS OIDC provider validates the token
-          → IAM Role: orders-api-role
-              → Secrets Manager: orderflow/db-password
-```
-
-One IAM role per service. No credentials in environment variables. No shared instance profiles.
 
 ## Challenges
 
-1. Provision an EKS cluster with managed node groups via Terraform
-2. Install the AWS Load Balancer Controller via Helm
-3. Deploy the Orders API as a Helm chart with an `Ingress` resource (ALB annotations)
-4. Configure IRSA for the Orders API — bind its ServiceAccount to an IAM role with Secrets Manager read access
-5. Install Karpenter — configure a NodePool and EC2NodeClass
-6. Apply NetworkPolicies: default-deny-all in the `orderflow` namespace, then explicit allow rules between services
+1. Provision an EKS cluster with Terraform. Use managed node groups (not Fargate profiles for the core API — Fargate on EKS has limitations around DaemonSets and storage).
+2. Install the AWS Load Balancer Controller via Helm. This controller watches Kubernetes `Ingress` resources and creates ALBs in AWS automatically.
+3. Deploy the Orders API as a Helm chart. Configure the `Ingress` with ALB annotations. Confirm external traffic routes through.
+4. Configure IRSA (IAM Roles for Service Accounts) — the Kubernetes equivalent of ECS task roles. The Orders API pod gets an IAM role that can read from Secrets Manager. Other pods cannot.
+5. Set up cluster autoscaler or Karpenter (Karpenter is preferred — it provisions the right instance type for the workload rather than scaling a fixed node group).
+6. Apply NetworkPolicies: default-deny-all in the `orderflow` namespace, then explicit allow rules between services.
+
+## AWS concept: IRSA
+
+```mermaid
+flowchart LR
+    POD["Pod\nServiceAccount: orders-api"] -->|"AssumeRoleWithWebIdentity"| STS["AWS STS"]
+    STS -->|"IAM OIDC provider\n(EKS cluster OIDC endpoint)"| ROLE["IAM Role\norders-api-role"]
+    ROLE --> SM["Secrets Manager\norderflow/db-password"]
+```
+
+IRSA binds a Kubernetes ServiceAccount to an IAM role. The binding is verified by the EKS OIDC provider. No credentials in environment variables. No shared instance profiles. One IAM role per service.
 
 ## Outcome
 
-All long-running services run on EKS with namespace isolation, RBAC, and NetworkPolicies. New services are deployed with `helm install` — no manual AWS console work.
+All long-running services run on EKS with namespace isolation, RBAC, and NetworkPolicies. Each service has its own IAM role via IRSA. New services are deployed with `helm install` — no manual AWS console work.
 
 ## Cost breakdown
 
@@ -87,4 +78,4 @@ cd terraform && terraform destroy -auto-approve
 
 ---
 
-[Back to main README](../README.md)
+[Back to main README](../README.md) | [Next: Phase 10 — Observability](../phase-10-observability/README.md)

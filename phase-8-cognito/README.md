@@ -2,51 +2,59 @@
 
 > **AWS services introduced:** Cognito User Pools, Cognito Identity Pools, ALB authentication | **Daily cost:** ~$6.40/day (<50K MAU free)
 
-## Objective
+---
 
-Replace the custom session-based auth system with Cognito. The monolith stops handling login, registration, and session management entirely. The ALB enforces authentication before requests reach the containers.
+## AWS services introduced
 
-## AWS services
+| Service | What it does | Why we need it |
+|---|---|---|
+| **Cognito User Pools** | Managed user directory | Handles sign-up, sign-in, MFA, password reset — without writing auth code |
+| **Cognito Identity Pools** | Federated identities | Maps authenticated users to AWS credentials for direct-to-S3 uploads |
+| **ALB authentication** | OIDC integration on the load balancer | Enforces authentication before requests reach your containers |
 
-| Service | Why we need it |
-|---|---|
-| **Cognito User Pools** | Managed user directory — sign-up, sign-in, MFA, password reset |
-| **Cognito Identity Pools** | Maps authenticated users to temporary AWS credentials |
-| **ALB authentication** | Enforces login at the load balancer before requests reach ECS |
+## The problem
 
-## Terraform structure
+OrderFlow's auth is a custom session-based system: the user logs in, the server writes a session to Redis, every request reads the session to determine who the user is. This works but:
+- Password reset, MFA, account lockout, social login — all custom code
+- Sessions in Redis require ElastiCache to be available for every request
+- No token-based API access for mobile or third-party integrations
 
-```
-terraform/
-├── cognito.tf       # User Pool, App Client, hosted UI domain
-├── alb_auth.tf      # ALB listener rule: authenticate-cognito action
-└── variables.tf
-```
+Cognito provides all of this as a managed service. You define user pool configuration. Cognito handles the implementation.
 
 ## How ALB authentication works
 
+```mermaid
+sequenceDiagram
+    participant Browser
+    participant ALB
+    participant Cognito
+    participant ECS as ECS — OrderFlow
+
+    Browser->>ALB: GET /orders (no token)
+    ALB->>Browser: Redirect to Cognito hosted UI
+    Browser->>Cognito: Log in
+    Cognito->>ALB: Authorization code
+    ALB->>Cognito: Exchange code for tokens
+    ALB->>Browser: Set auth cookie
+    Browser->>ALB: GET /orders (with cookie)
+    ALB->>ECS: GET /orders + X-Amzn-Oidc-Data header
+    ECS->>ECS: Decode JWT from header (no session needed)
 ```
-Browser → GET /orders (no token) → ALB
-ALB → redirect to Cognito hosted UI
-User logs in → Cognito returns auth code to ALB
-ALB exchanges code for tokens → sets auth cookie
-Browser → GET /orders (with cookie) → ALB
-ALB → ECS with X-Amzn-Oidc-Data header (signed JWT)
-ECS reads user identity from JWT header — no session store needed
-```
+
+The ALB handles the entire OAuth flow. Your application receives a signed JWT in a request header. No auth middleware. No session store. No Redis dependency for authentication.
 
 ## Challenges
 
-1. Create a Cognito User Pool with email sign-in, optional MFA, and a hosted UI
-2. Configure the ALB listener with the `authenticate-cognito` action
-3. Migrate existing users: export from PostgreSQL, import via `AdminCreateUser` API
-4. Update OrderFlow to read user identity from the `X-Amzn-Oidc-Data` JWT header
-5. Remove custom auth routes (`/login`, `/logout`, `/register`) from the monolith
-6. Remove the ElastiCache session store dependency from the app (ElastiCache remains for query caching)
+1. Create a Cognito User Pool with email sign-in, MFA optional, and a hosted UI
+2. Configure the ALB listener to use Cognito for authentication (`authenticate-cognito` action)
+3. Migrate existing users: export from PostgreSQL, import to Cognito via the `AdminCreateUser` API (with a temporary password and `FORCE_CHANGE_PASSWORD` status)
+4. Update OrderFlow to read the user identity from the `X-Amzn-Oidc-Data` JWT header instead of the Redis session
+5. Remove the custom auth routes (`/login`, `/logout`, `/register`) from the monolith — Cognito's hosted UI replaces them
+6. Remove the ElastiCache session store dependency from the app (ElastiCache is still used for query caching, but no longer for sessions)
 
 ## Outcome
 
-Auth is fully managed by Cognito. The monolith has no auth code. MFA is available to all users with zero additional code.
+Auth is fully managed by Cognito. The monolith has no auth code. Session infrastructure complexity is eliminated. MFA is available to all users with zero additional code.
 
 ## Cost breakdown
 
@@ -62,4 +70,4 @@ cd terraform && terraform destroy -auto-approve
 
 ---
 
-[Back to main README](../README.md)
+[Back to main README](../README.md) | [Next: Phase 9 — EKS](../phase-9-eks/README.md)
