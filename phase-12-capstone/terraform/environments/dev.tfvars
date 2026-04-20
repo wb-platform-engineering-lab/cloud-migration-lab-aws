@@ -1,0 +1,10 @@
+environment        = "dev"
+ec2_instance_type  = "t2.micro"
+rds_instance_class = "db.t3.micro"
+rds_multi_az       = false
+eks_node_type      = "t3.small"
+eks_node_min       = 1
+eks_node_max       = 2
+eks_node_desired   = 1
+enable_waf         = false
+nat_type           = "instance"
