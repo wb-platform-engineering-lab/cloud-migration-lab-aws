@@ -1,0 +1,11 @@
+environment        = "prod"
+aws_region         = "us-east-1"
+ec2_instance_type  = "t3.small"
+rds_instance_class = "db.t3.micro"
+rds_multi_az       = true
+eks_node_type      = "t3.small"
+eks_node_min       = 2
+eks_node_max       = 4
+eks_node_desired   = 2
+enable_waf         = true
+nat_type           = "instance"

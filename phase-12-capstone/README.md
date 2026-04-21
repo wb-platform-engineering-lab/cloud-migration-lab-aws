@@ -147,33 +147,100 @@ Control Tower cannot be configured via CLI or Terraform. Open the AWS Console �
 
 ---
 
-## Challenge 2 — Terraform workspaces for multi-environment
+## Challenge 2 — Separate environment folders for multi-environment Terraform
 
-**Goal:** Use a single Terraform codebase with workspaces to deploy different-sized infrastructure in dev, staging, and prod. Each workspace has its own state file.
+**Goal:** Use a separate folder per environment so each has its own state, its own backend configuration, and can be deployed or destroyed independently without any workspace switching.
 
-### Step 1: Understand the workspace strategy
+### Step 1: Understand the folder strategy
+
+Each environment is a self-contained Terraform root. Shared logic lives in modules. There is no workspace concept — `cd` into the folder you want to operate on.
 
 ```
 phase-12-capstone/terraform/
-├── backend.tf          # Remote state in management account S3
-├── main.tf             # Calls all modules
-├── variables.tf        # Shared variable declarations
+├── modules/
+│   ├── vpc/
+│   │   ├── main.tf
+│   │   ├── variables.tf
+│   │   └── outputs.tf
+│   ├── rds/
+│   │   ├── main.tf
+│   │   ├── variables.tf
+│   │   └── outputs.tf
+│   └── eks/
+│       ├── main.tf
+│       ├── variables.tf
+│       └── outputs.tf
 ├── environments/
-│   ├── dev.tfvars      # t2.micro, single-AZ, 1 NAT instance
-│   ├── staging.tfvars  # t3.small, multi-AZ, 1 NAT instance
-│   └── prod.tfvars     # t3.small, multi-AZ, 1 NAT instance, WAF
-└── modules/
-    ├── vpc/
-    ├── rds/
-    └── eks/
+│   ├── dev/
+│   │   ├── backend.tf      # State key: phase-12/dev/terraform.tfstate
+│   │   ├── main.tf         # Calls shared modules
+│   │   ├── variables.tf
+│   │   └── terraform.tfvars
+│   ├── staging/
+│   │   ├── backend.tf      # State key: phase-12/staging/terraform.tfstate
+│   │   ├── main.tf
+│   │   ├── variables.tf
+│   │   └── terraform.tfvars
+│   └── prod/
+│       ├── backend.tf      # State key: phase-12/prod/terraform.tfstate
+│       ├── main.tf
+│       ├── variables.tf
+│       └── terraform.tfvars
 ```
 
-### Step 2: Create environment-specific variable files
+### Step 2: Create the backend files
 
-Create `phase-12-capstone/terraform/environments/dev.tfvars`:
+Each environment gets its own backend pointing to a different S3 key. This means state is fully isolated — a `terraform destroy` in `dev` cannot touch `prod` state.
+
+Create `phase-12-capstone/terraform/environments/dev/backend.tf`:
+
+```hcl
+terraform {
+  backend "s3" {
+    bucket         = "orderflow-tfstate-<management-account-id>"
+    key            = "phase-12/dev/terraform.tfstate"
+    region         = "us-east-1"
+    dynamodb_table = "orderflow-tfstate-lock"
+    encrypt        = true
+  }
+}
+```
+
+Create `phase-12-capstone/terraform/environments/staging/backend.tf`:
+
+```hcl
+terraform {
+  backend "s3" {
+    bucket         = "orderflow-tfstate-<management-account-id>"
+    key            = "phase-12/staging/terraform.tfstate"
+    region         = "us-east-1"
+    dynamodb_table = "orderflow-tfstate-lock"
+    encrypt        = true
+  }
+}
+```
+
+Create `phase-12-capstone/terraform/environments/prod/backend.tf`:
+
+```hcl
+terraform {
+  backend "s3" {
+    bucket         = "orderflow-tfstate-<management-account-id>"
+    key            = "phase-12/prod/terraform.tfstate"
+    region         = "us-east-1"
+    dynamodb_table = "orderflow-tfstate-lock"
+    encrypt        = true
+  }
+}
+```
+
+### Step 3: Create the environment variable files
+
+Create `phase-12-capstone/terraform/environments/dev/terraform.tfvars`:
 
 ```hcl
 environment        = "dev"
+aws_region         = "us-east-1"
 ec2_instance_type  = "t2.micro"
 rds_instance_class = "db.t3.micro"
 rds_multi_az       = false
@@ -182,13 +249,14 @@ eks_node_min       = 1
 eks_node_max       = 2
 eks_node_desired   = 1
 enable_waf         = false
-nat_type           = "instance" # NAT instance — free tier
+nat_type           = "instance"
 ```
 
-Create `phase-12-capstone/terraform/environments/staging.tfvars`:
+Create `phase-12-capstone/terraform/environments/staging/terraform.tfvars`:
 
 ```hcl
 environment        = "staging"
+aws_region         = "us-east-1"
 ec2_instance_type  = "t3.small"
 rds_instance_class = "db.t3.micro"
 rds_multi_az       = false
@@ -200,13 +268,14 @@ enable_waf         = true
 nat_type           = "instance"
 ```
 
-Create `phase-12-capstone/terraform/environments/prod.tfvars`:
+Create `phase-12-capstone/terraform/environments/prod/terraform.tfvars`:
 
 ```hcl
 environment        = "prod"
+aws_region         = "us-east-1"
 ec2_instance_type  = "t3.small"
 rds_instance_class = "db.t3.micro"
-rds_multi_az       = true  # Multi-AZ only in prod for the failover challenge
+rds_multi_az       = true
 eks_node_type      = "t3.small"
 eks_node_min       = 2
 eks_node_max       = 4
@@ -215,53 +284,94 @@ enable_waf         = true
 nat_type           = "instance"
 ```
 
-### Step 3: Use Terraform workspaces
+### Step 4: Create the main.tf that calls shared modules
 
-Each workspace stores state in a separate S3 key automatically:
+Each environment folder has the same `main.tf` structure — only `terraform.tfvars` differs. Create this in each of the three environment folders:
+
+```hcl
+# phase-12-capstone/terraform/environments/<env>/main.tf
+
+provider "aws" {
+  region = var.aws_region
+}
+
+module "vpc" {
+  source      = "../../modules/vpc"
+  environment = var.environment
+  nat_type    = var.nat_type
+}
+
+module "rds" {
+  source             = "../../modules/rds"
+  environment        = var.environment
+  vpc_id             = module.vpc.vpc_id
+  private_subnet_ids = module.vpc.private_subnet_ids
+  instance_class     = var.rds_instance_class
+  multi_az           = var.rds_multi_az
+}
+
+module "eks" {
+  source             = "../../modules/eks"
+  environment        = var.environment
+  vpc_id             = module.vpc.vpc_id
+  private_subnet_ids = module.vpc.private_subnet_ids
+  node_type          = var.eks_node_type
+  node_min           = var.eks_node_min
+  node_max           = var.eks_node_max
+  node_desired       = var.eks_node_desired
+  enable_waf         = var.enable_waf
+}
+```
+
+### Step 5: Deploy each environment independently
+
+No workspace switching — just `cd` into the folder:
 
 ```bash
-cd phase-12-capstone/terraform
-
-# Create and deploy dev
-terraform workspace new dev
+# Deploy dev
+cd phase-12-capstone/terraform/environments/dev
 terraform init
-terraform plan -var-file="environments/dev.tfvars"
-terraform apply -var-file="environments/dev.tfvars" -auto-approve
+terraform plan
+terraform apply -auto-approve
 
-# Create and deploy staging
-terraform workspace new staging
-terraform apply -var-file="environments/staging.tfvars" -auto-approve
+# Deploy staging (separate shell or after dev)
+cd phase-12-capstone/terraform/environments/staging
+terraform init
+terraform plan
+terraform apply -auto-approve
 
-# Create and deploy prod
-terraform workspace new prod
-terraform apply -var-file="environments/prod.tfvars" -auto-approve
-
-# List workspaces
-terraform workspace list
+# Deploy prod
+cd phase-12-capstone/terraform/environments/prod
+terraform init
+terraform plan
+terraform apply -auto-approve
 ```
 
-Expected:
-
-```
-  default
-  dev
-* prod
-  staging
-```
-
-### Step 4: Verify separate state files in S3
+### Step 6: Verify separate state files in S3
 
 ```bash
-aws s3 ls "s3://orderflow-tfstate-${AWS_ACCOUNT_ID}/env:/" --recursive
+aws s3 ls "s3://orderflow-tfstate-${MGMT_ACCOUNT_ID}/phase-12/" --recursive
 ```
 
-Expected — one state file per workspace:
+Expected — one state file per environment folder:
 
 ```
-... env:/dev/phase-12/terraform.tfstate
-... env:/staging/phase-12/terraform.tfstate
-... env:/prod/phase-12/terraform.tfstate
+... phase-12/dev/terraform.tfstate
+... phase-12/staging/terraform.tfstate
+... phase-12/prod/terraform.tfstate
 ```
+
+Each state file is independent. Destroying dev has zero effect on staging or prod state.
+
+### Why separate folders instead of workspaces
+
+| | Workspaces | Separate folders |
+|---|---|---|
+| State isolation | S3 key prefix per workspace | Separate S3 key per folder |
+| Accidental cross-env apply | Possible (wrong `workspace select`) | Impossible — you must `cd` into the folder |
+| Backend config per env | Single shared backend | Each env owns its backend |
+| CI/CD targeting | Requires passing workspace name | `cd environments/prod && terraform apply` |
+| Visibility in S3 | `env:/dev/...` paths | `phase-12/dev/...` — explicit and browsable |
 
 ---
 
@@ -707,7 +817,6 @@ SCPs must be applied from the management account:
 
 ```bash
 cd phase-12-capstone/terraform
-terraform workspace select default   # management account workspace
 
 terraform plan -target=aws_organizations_policy.deny_root_actions \
                -target=aws_organizations_policy.deny_leave_org \
@@ -1407,11 +1516,11 @@ aws rds create-db-snapshot \
   --db-snapshot-identifier orderflow-postgres-$(date +%Y%m%d)
 
 # Destroy RDS (saves $0.81/day)
-terraform workspace select prod
+cd phase-12-capstone/terraform/environments/prod
 terraform destroy -target=aws_db_instance.main -auto-approve
 
 # Next session: restore from snapshot
-terraform apply -var-file="environments/prod.tfvars" \
+terraform apply \
   -var="rds_snapshot_identifier=orderflow-postgres-$(date +%Y%m%d)" \
   -auto-approve
 ```
@@ -1470,13 +1579,14 @@ OrderFlow runs in three isolated AWS accounts governed by ten SCPs and deployed 
 | **shared** | GuardDuty, Config, Security Hub, CloudTrail | ~$1.50 |
 | **Total** | | **~$18–22/day** |
 
-> Run Phase 12 in sprint mode — provision all environments, complete the capstone scenario (all 6 challenges), destroy within 3–4 days. Total cost: ~$65–85.
+> Run Phase 12 in sprint mode — provision all environments, complete the capstone scenario (all 7 challenges), destroy within 3–4 days. Total cost: ~$65–85.
 
 ```bash
 # Destroy in reverse order: prod → staging → dev
 for env in prod staging dev; do
-  terraform workspace select $env
-  terraform destroy -var-file="environments/${env}.tfvars" -auto-approve
+  cd "phase-12-capstone/terraform/environments/${env}"
+  terraform destroy -auto-approve
+  cd -
 done
 ```
 
