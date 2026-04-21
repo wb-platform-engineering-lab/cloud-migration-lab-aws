@@ -34,10 +34,11 @@ Management Account
 Six months have passed. Black Friday is in two weeks. You need to demonstrate:
 
 1. A code change goes from `git push` → CI → dev → staging (manual approval) → prod — no manual AWS console clicks
-2. GuardDuty and WAF are active in all three accounts. Security Hub aggregates findings into the audit account.
-3. Simulated incident: RDS Multi-AZ failover. Orders continue with less than 60 seconds of elevated error rate.
-4. Cost report: AWS Cost Explorer breakdown by account, service, and tag. Top three cost drivers identified.
-5. A new engineer can `git clone`, `docker compose up`, and place an order without any AWS access.
+2. Ten SCPs are attached to the Workloads OU. Every forbidden action returns `AccessDenied`.
+3. GuardDuty and WAF are active in all three accounts. Security Hub aggregates findings into the audit account.
+4. Simulated incident: RDS Multi-AZ failover. Orders continue with less than 60 seconds of elevated error rate.
+5. Cost report: AWS Cost Explorer breakdown by account, service, and tag. Top three cost drivers identified.
+6. A new engineer can `git clone`, `docker compose up`, and place an order without any AWS access.
 
 ---
 
@@ -264,7 +265,630 @@ Expected — one state file per workspace:
 
 ---
 
-## Challenge 3 — GitOps promotion pipeline
+## Challenge 3 — Service Control Policies and governance
+
+**Goal:** Attach the ten most impactful SCPs from the AWS Well-Architected Framework to the Workloads OU. Understand which WAF pillar each SCP enforces. Verify that each policy actually blocks the forbidden action before deploying any workloads.
+
+### Why SCPs before deployments
+
+SCPs are *preventive* controls — they act at the API layer before any IAM policy is evaluated. Once attached to an OU, no amount of `AdministratorAccess` inside a member account can override them. This is the right moment to set them: accounts exist, workspaces exist, nothing is deployed yet. Retrofitting SCPs onto a running environment risks locking out a running service.
+
+### AWS Well-Architected Framework mapping
+
+| # | SCP | WAF Pillar | WAF Design Principle |
+|---|---|---|---|
+| 1 | Deny root user actions | Security | SEC 02 — Use strong identity controls |
+| 2 | Deny leaving the Organization | Security | SEC 01 — Implement a strong identity foundation |
+| 3 | Deny disabling CloudTrail | Security | SEC 04 — Detect and investigate security events |
+| 4 | Deny disabling GuardDuty | Security | SEC 04 — Detect and investigate security events |
+| 5 | Deny disabling AWS Config | Security | SEC 04 — Detect and investigate security events |
+| 6 | Restrict to approved regions | Security | SEC 01 — Reduce scope of data residency risk |
+| 7 | Deny IAM user and access key creation | Security | SEC 02 — Enforce federated identity, no long-lived keys |
+| 8 | Deny public S3 bucket ACLs | Security | SEC 07 — Classify and protect your data |
+| 9 | Require encryption at rest | Security | SEC 08 — Protect data at rest |
+| 10 | Deny non-approved EC2 instance types | Cost Optimization | COST 06 — Right-size compute to workload needs |
+
+### Step 1: Create the SCP Terraform file
+
+Create `phase-12-capstone/terraform/scps.tf`:
+
+```hcl
+# ---------------------------------------------------------------------------
+# Data sources — resolve the Workloads OU ID and Organization root
+# ---------------------------------------------------------------------------
+
+data "aws_organizations_organization" "current" {}
+
+data "aws_organizations_organizational_units" "root" {
+  parent_id = data.aws_organizations_organization.current.roots[0].id
+}
+
+locals {
+  workloads_ou_id = [
+    for ou in data.aws_organizations_organizational_units.root.children :
+    ou.id if ou.name == "Workloads"
+  ][0]
+}
+
+# ---------------------------------------------------------------------------
+# SCP 1 — Deny root user actions
+# WAF: Security — SEC 02
+# The root user bypasses all IAM policies. Locking it down is the single
+# highest-impact control in any multi-account setup.
+# ---------------------------------------------------------------------------
+
+resource "aws_organizations_policy" "deny_root_actions" {
+  name        = "orderflow-deny-root-actions"
+  description = "Prevent root user from performing any action in member accounts"
+  type        = "SERVICE_CONTROL_POLICY"
+
+  content = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "DenyRootActions"
+      Effect    = "Deny"
+      Action    = "*"
+      Resource  = "*"
+      Condition = {
+        StringLike = {
+          "aws:PrincipalArn" = ["arn:aws:iam::*:root"]
+        }
+      }
+    }]
+  })
+}
+
+resource "aws_organizations_policy_attachment" "deny_root_actions" {
+  policy_id = aws_organizations_policy.deny_root_actions.id
+  target_id = local.workloads_ou_id
+}
+
+# ---------------------------------------------------------------------------
+# SCP 2 — Deny leaving the Organization
+# WAF: Security — SEC 01
+# Prevents a compromised account from being exfiltrated out of the OU
+# structure and away from centralized logging and guardrails.
+# ---------------------------------------------------------------------------
+
+resource "aws_organizations_policy" "deny_leave_org" {
+  name        = "orderflow-deny-leave-org"
+  description = "Prevent member accounts from leaving the Organization"
+  type        = "SERVICE_CONTROL_POLICY"
+
+  content = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "DenyLeaveOrganization"
+      Effect   = "Deny"
+      Action   = ["organizations:LeaveOrganization"]
+      Resource = "*"
+    }]
+  })
+}
+
+resource "aws_organizations_policy_attachment" "deny_leave_org" {
+  policy_id = aws_organizations_policy.deny_leave_org.id
+  target_id = local.workloads_ou_id
+}
+
+# ---------------------------------------------------------------------------
+# SCP 3 — Deny disabling CloudTrail
+# WAF: Security — SEC 04
+# CloudTrail is the immutable audit trail. An attacker's first action after
+# obtaining credentials is often to disable logging.
+# ---------------------------------------------------------------------------
+
+resource "aws_organizations_policy" "deny_disable_cloudtrail" {
+  name        = "orderflow-deny-disable-cloudtrail"
+  description = "Prevent CloudTrail from being stopped, deleted, or modified"
+  type        = "SERVICE_CONTROL_POLICY"
+
+  content = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid    = "DenyDisableCloudTrail"
+      Effect = "Deny"
+      Action = [
+        "cloudtrail:DeleteTrail",
+        "cloudtrail:StopLogging",
+        "cloudtrail:UpdateTrail",
+        "cloudtrail:PutEventSelectors",
+      ]
+      Resource = "*"
+    }]
+  })
+}
+
+resource "aws_organizations_policy_attachment" "deny_disable_cloudtrail" {
+  policy_id = aws_organizations_policy.deny_disable_cloudtrail.id
+  target_id = local.workloads_ou_id
+}
+
+# ---------------------------------------------------------------------------
+# SCP 4 — Deny disabling GuardDuty
+# WAF: Security — SEC 04
+# GuardDuty is the runtime threat detection layer. Disabling it is a common
+# step in credential-abuse attacks to prevent alerting.
+# ---------------------------------------------------------------------------
+
+resource "aws_organizations_policy" "deny_disable_guardduty" {
+  name        = "orderflow-deny-disable-guardduty"
+  description = "Prevent GuardDuty from being disabled or its findings deleted"
+  type        = "SERVICE_CONTROL_POLICY"
+
+  content = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid    = "DenyDisableGuardDuty"
+      Effect = "Deny"
+      Action = [
+        "guardduty:DeleteDetector",
+        "guardduty:DisassociateFromMasterAccount",
+        "guardduty:StopMonitoringMembers",
+        "guardduty:UpdateDetector",
+        "guardduty:DeletePublishingDestination",
+        "guardduty:DeleteThreatIntelSet",
+        "guardduty:DeleteIPSet",
+      ]
+      Resource = "*"
+    }]
+  })
+}
+
+resource "aws_organizations_policy_attachment" "deny_disable_guardduty" {
+  policy_id = aws_organizations_policy.deny_disable_guardduty.id
+  target_id = local.workloads_ou_id
+}
+
+# ---------------------------------------------------------------------------
+# SCP 5 — Deny disabling AWS Config
+# WAF: Security — SEC 04
+# Config records every resource configuration change. Disabling it removes
+# the ability to detect drift and satisfy compliance audits.
+# ---------------------------------------------------------------------------
+
+resource "aws_organizations_policy" "deny_disable_config" {
+  name        = "orderflow-deny-disable-config"
+  description = "Prevent AWS Config recorder and delivery channel from being disabled"
+  type        = "SERVICE_CONTROL_POLICY"
+
+  content = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid    = "DenyDisableConfig"
+      Effect = "Deny"
+      Action = [
+        "config:DeleteConfigurationRecorder",
+        "config:DeleteDeliveryChannel",
+        "config:StopConfigurationRecorder",
+        "config:DeleteRetentionConfiguration",
+      ]
+      Resource = "*"
+    }]
+  })
+}
+
+resource "aws_organizations_policy_attachment" "deny_disable_config" {
+  policy_id = aws_organizations_policy.deny_disable_config.id
+  target_id = local.workloads_ou_id
+}
+
+# ---------------------------------------------------------------------------
+# SCP 6 — Restrict to approved regions
+# WAF: Security — SEC 01 / data residency
+# Forces all API calls into the regions your team operates in. Reduces the
+# blast radius of credential compromise and satisfies data-residency
+# requirements (GDPR, PCI-DSS) by making out-of-region writes impossible.
+# ---------------------------------------------------------------------------
+
+resource "aws_organizations_policy" "deny_non_approved_regions" {
+  name        = "orderflow-deny-non-approved-regions"
+  description = "Restrict all actions to us-east-1 and us-west-2 only"
+  type        = "SERVICE_CONTROL_POLICY"
+
+  content = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid    = "DenyNonApprovedRegions"
+      Effect = "Deny"
+      # NotAction excludes global services that have no region concept
+      NotAction = [
+        "iam:*",
+        "organizations:*",
+        "support:*",
+        "sts:*",
+        "cloudfront:*",
+        "waf:*",
+        "route53:*",
+        "budgets:*",
+        "ce:*",
+        "health:*",
+      ]
+      Resource = "*"
+      Condition = {
+        StringNotEquals = {
+          "aws:RequestedRegion" = ["us-east-1", "us-west-2"]
+        }
+      }
+    }]
+  })
+}
+
+resource "aws_organizations_policy_attachment" "deny_non_approved_regions" {
+  policy_id = aws_organizations_policy.deny_non_approved_regions.id
+  target_id = local.workloads_ou_id
+}
+
+# ---------------------------------------------------------------------------
+# SCP 7 — Deny IAM user and access key creation
+# WAF: Security — SEC 02
+# Long-lived IAM access keys are the most common source of credential leaks
+# (GitHub secret scans, leaked .env files). All human access must go through
+# IAM Identity Center (SSO). Service access must use IAM roles.
+# ---------------------------------------------------------------------------
+
+resource "aws_organizations_policy" "deny_iam_users" {
+  name        = "orderflow-deny-iam-users"
+  description = "Prohibit long-lived IAM users and access keys; require SSO and roles"
+  type        = "SERVICE_CONTROL_POLICY"
+
+  content = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid    = "DenyIAMUsersAndKeys"
+      Effect = "Deny"
+      Action = [
+        "iam:CreateUser",
+        "iam:CreateAccessKey",
+        "iam:CreateLoginProfile",
+        "iam:UpdateAccessKey",
+      ]
+      Resource = "*"
+    }]
+  })
+}
+
+resource "aws_organizations_policy_attachment" "deny_iam_users" {
+  policy_id = aws_organizations_policy.deny_iam_users.id
+  target_id = local.workloads_ou_id
+}
+
+# ---------------------------------------------------------------------------
+# SCP 8 — Deny public S3 bucket ACLs
+# WAF: Security — SEC 07
+# Public S3 buckets are the leading cause of data breaches in AWS.
+# This SCP prevents any bucket from being made public at the ACL level,
+# independently of the account-level S3 Block Public Access setting.
+# ---------------------------------------------------------------------------
+
+resource "aws_organizations_policy" "deny_public_s3" {
+  name        = "orderflow-deny-public-s3"
+  description = "Prevent S3 buckets and objects from being made publicly accessible"
+  type        = "SERVICE_CONTROL_POLICY"
+
+  content = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "DenyPublicBucketACL"
+        Effect = "Deny"
+        Action = ["s3:PutBucketAcl"]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "s3:x-amz-acl" = ["public-read", "public-read-write", "authenticated-read"]
+          }
+        }
+      },
+      {
+        Sid    = "DenyDisableS3BlockPublicAccess"
+        Effect = "Deny"
+        Action = ["s3:PutBucketPublicAccessBlock"]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "s3:BlockPublicAcls"       = "false"
+            "s3:IgnorePublicAcls"      = "false"
+            "s3:BlockPublicPolicy"     = "false"
+            "s3:RestrictPublicBuckets" = "false"
+          }
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_organizations_policy_attachment" "deny_public_s3" {
+  policy_id = aws_organizations_policy.deny_public_s3.id
+  target_id = local.workloads_ou_id
+}
+
+# ---------------------------------------------------------------------------
+# SCP 9 — Require encryption at rest
+# WAF: Security — SEC 08
+# Enforces encryption for EBS volumes, RDS instances, and S3 objects at
+# creation time. A missing encryption flag is caught at the API layer before
+# the resource is created, not after a compliance scan finds it.
+# ---------------------------------------------------------------------------
+
+resource "aws_organizations_policy" "require_encryption" {
+  name        = "orderflow-require-encryption-at-rest"
+  description = "Deny creation of unencrypted EBS volumes, RDS instances, and S3 objects"
+  type        = "SERVICE_CONTROL_POLICY"
+
+  content = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "DenyUnencryptedEBS"
+        Effect = "Deny"
+        Action = ["ec2:CreateVolume"]
+        Resource = "*"
+        Condition = {
+          Bool = { "ec2:Encrypted" = "false" }
+        }
+      },
+      {
+        Sid    = "DenyUnencryptedRDS"
+        Effect = "Deny"
+        Action = ["rds:CreateDBInstance"]
+        Resource = "*"
+        Condition = {
+          Bool = { "rds:StorageEncrypted" = "false" }
+        }
+      },
+      {
+        Sid    = "DenyUnencryptedS3Objects"
+        Effect = "Deny"
+        Action = ["s3:PutObject"]
+        Resource = "*"
+        Condition = {
+          StringNotEquals = {
+            "s3:x-amz-server-side-encryption" = ["AES256", "aws:kms"]
+          }
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_organizations_policy_attachment" "require_encryption" {
+  policy_id = aws_organizations_policy.require_encryption.id
+  target_id = local.workloads_ou_id
+}
+
+# ---------------------------------------------------------------------------
+# SCP 10 — Deny non-approved EC2 instance types
+# WAF: Cost Optimization — COST 06
+# Prevents engineers from accidentally launching oversized instances that
+# inflate the monthly bill. Only instance families appropriate for each
+# environment are permitted.
+# ---------------------------------------------------------------------------
+
+resource "aws_organizations_policy" "deny_large_instances" {
+  name        = "orderflow-deny-large-instances"
+  description = "Restrict EC2 instance types to t3, t4g, and m6i families only"
+  type        = "SERVICE_CONTROL_POLICY"
+
+  content = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid    = "DenyLargeInstances"
+      Effect = "Deny"
+      Action = ["ec2:RunInstances"]
+      Resource = "arn:aws:ec2:*:*:instance/*"
+      Condition = {
+        StringNotLike = {
+          "ec2:InstanceType" = [
+            "t2.*",
+            "t3.*",
+            "t3a.*",
+            "t4g.*",
+            "m6i.large",
+            "m6i.xlarge",
+            "m6a.large",
+            "m6a.xlarge",
+          ]
+        }
+      }
+    }]
+  })
+}
+
+resource "aws_organizations_policy_attachment" "deny_large_instances" {
+  policy_id = aws_organizations_policy.deny_large_instances.id
+  target_id = local.workloads_ou_id
+}
+```
+
+### Step 2: Apply the SCPs
+
+SCPs must be applied from the management account:
+
+```bash
+cd phase-12-capstone/terraform
+terraform workspace select default   # management account workspace
+
+terraform plan -target=aws_organizations_policy.deny_root_actions \
+               -target=aws_organizations_policy.deny_leave_org \
+               -target=aws_organizations_policy.deny_disable_cloudtrail \
+               -target=aws_organizations_policy.deny_disable_guardduty \
+               -target=aws_organizations_policy.deny_disable_config \
+               -target=aws_organizations_policy.deny_non_approved_regions \
+               -target=aws_organizations_policy.deny_iam_users \
+               -target=aws_organizations_policy.deny_public_s3 \
+               -target=aws_organizations_policy.require_encryption \
+               -target=aws_organizations_policy.deny_large_instances
+
+terraform apply -auto-approve
+```
+
+Verify all ten policies were created and attached:
+
+```bash
+aws organizations list-policies --filter SERVICE_CONTROL_POLICY \
+  --query 'Policies[*].{Name:Name,Id:Id}' \
+  --output table
+```
+
+Expected:
+
+```
+------------------------------------------------------------------
+|                        ListPolicies                            |
++-------------------------------------+--------------------------+
+|  Name                               |  Id                      |
++-------------------------------------+--------------------------+
+|  orderflow-deny-root-actions        |  p-xxxxxxxxxxxx01        |
+|  orderflow-deny-leave-org           |  p-xxxxxxxxxxxx02        |
+|  orderflow-deny-disable-cloudtrail  |  p-xxxxxxxxxxxx03        |
+|  orderflow-deny-disable-guardduty   |  p-xxxxxxxxxxxx04        |
+|  orderflow-deny-disable-config      |  p-xxxxxxxxxxxx05        |
+|  orderflow-deny-non-approved-regions|  p-xxxxxxxxxxxx06        |
+|  orderflow-deny-iam-users           |  p-xxxxxxxxxxxx07        |
+|  orderflow-deny-public-s3           |  p-xxxxxxxxxxxx08        |
+|  orderflow-require-encryption       |  p-xxxxxxxxxxxx09        |
+|  orderflow-deny-large-instances     |  p-xxxxxxxxxxxx10        |
++-------------------------------------+--------------------------+
+```
+
+Confirm all ten are attached to the Workloads OU:
+
+```bash
+WORKLOADS_OU=$(aws organizations list-organizational-units-for-parent \
+  --parent-id $(aws organizations list-roots --query 'Roots[0].Id' --output text) \
+  --query "OrganizationalUnits[?Name=='Workloads'].Id" \
+  --output text)
+
+aws organizations list-policies-for-target \
+  --target-id "$WORKLOADS_OU" \
+  --filter SERVICE_CONTROL_POLICY \
+  --query 'Policies[*].Name' \
+  --output table
+```
+
+### Step 3: Validate each SCP fires
+
+Switch to the dev account and attempt each forbidden action. Every attempt below must return an `AccessDenied` error.
+
+**SCP 1 — Root user block**
+
+```bash
+# Attempt to use the root user credentials (switch to root in the console,
+# then try any API call)
+aws sts get-caller-identity --profile dev-root
+# Expected: An error occurred (AccessDenied)
+```
+
+**SCP 3 — CloudTrail cannot be stopped**
+
+```bash
+TRAIL=$(aws cloudtrail describe-trails --profile dev \
+  --query 'trailList[0].TrailARN' --output text)
+
+aws cloudtrail stop-logging --name "$TRAIL" --profile dev
+# Expected: An error occurred (AccessDenied) when calling the StopLogging operation
+```
+
+**SCP 6 — Region restriction**
+
+```bash
+aws ec2 describe-instances --region eu-west-1 --profile dev
+# Expected: An error occurred (AccessDenied) ... Explicit deny in a
+# service control policy
+```
+
+**SCP 7 — No IAM users**
+
+```bash
+aws iam create-user --user-name test-scp --profile dev
+# Expected: An error occurred (AccessDenied) when calling the CreateUser operation
+```
+
+**SCP 8 — No public S3**
+
+```bash
+BUCKET="orderflow-scp-test-$(date +%s)"
+aws s3 mb "s3://${BUCKET}" --profile dev
+aws s3api put-bucket-acl --bucket "$BUCKET" --acl public-read --profile dev
+# Expected: An error occurred (AccessDenied) when calling the PutBucketAcl operation
+
+# Clean up
+aws s3 rb "s3://${BUCKET}" --profile dev
+```
+
+**SCP 9 — Unencrypted EBS denied**
+
+```bash
+aws ec2 create-volume \
+  --availability-zone us-east-1a \
+  --size 1 \
+  --no-encrypted \
+  --profile dev
+# Expected: An error occurred (AccessDenied) when calling the CreateVolume operation
+```
+
+**SCP 10 — Large instance denied**
+
+```bash
+aws ec2 run-instances \
+  --image-id resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
+  --instance-type c5.4xlarge \
+  --min-count 1 --max-count 1 \
+  --profile dev
+# Expected: An error occurred (AccessDenied) when calling the RunInstances operation
+```
+
+All seven spot-checks pass. Your accounts are now governed by preventive controls that cannot be overridden from inside any member account.
+
+### Step 4: Understand the SCP evaluation logic
+
+```
+API call arrives in member account
+         │
+         ▼
+  SCP attached to OU?  ──── No ──── Allow (falls through to IAM)
+         │
+        Yes
+         │
+         ▼
+  Action matches a Deny? ── Yes ─── DENY (immediately, no further evaluation)
+         │
+         No
+         │
+         ▼
+  Action matches an Allow? ─ No ──── DENY (implicit deny; FullAWSAccess SCP
+         │                                  must explicitly allow it)
+        Yes
+         │
+         ▼
+  Evaluate IAM identity policy and resource policy as normal
+```
+
+> **Key point:** The default `FullAWSAccess` SCP that Organizations attaches to every account is a broad `Allow *`. Your custom SCPs layer `Deny` statements on top. A Deny always wins — even `AdministratorAccess` cannot override an SCP Deny. If you create a custom OU-level Allow-only SCP and detach `FullAWSAccess`, you move to an allowlist model where only explicitly listed services work.
+
+### Step 5: Environment-specific SCP strategy
+
+Not every SCP should apply equally to every environment. A common pattern:
+
+| SCP | Root OU | Workloads OU | dev | staging | prod |
+|---|---|---|---|---|---|
+| Deny root actions | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Deny leave org | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Deny disable CloudTrail | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Deny disable GuardDuty | — | ✓ | ✓ | ✓ | ✓ |
+| Deny disable Config | — | ✓ | ✓ | ✓ | ✓ |
+| Region restriction | — | ✓ | ✓ | ✓ | ✓ |
+| Deny IAM users | — | — | — | ✓ | ✓ |
+| Deny public S3 | — | ✓ | ✓ | ✓ | ✓ |
+| Require encryption | — | — | — | ✓ | ✓ |
+| Deny large instances | — | ✓ | ✓ | ✓ | ✓ |
+
+Dev gets slightly looser controls to allow experimentation. Prod gets the full stack. This is implemented by creating per-environment OUs under Workloads and attaching the relevant subset of policies to each.
+
+---
+
+## Challenge 4 — GitOps promotion pipeline
 
 **Goal:** Build a GitHub Actions workflow that deploys to dev on every push to `main`, then promotes to staging automatically, then requires a manual approval gate before promoting to prod.
 
@@ -536,7 +1160,7 @@ Approve the prod deployment from the GitHub Actions UI. Expected:
 
 ---
 
-## Challenge 4 — Cross-account Security Hub aggregation
+## Challenge 5 — Cross-account Security Hub aggregation
 
 **Goal:** Designate the audit account as the Security Hub administrator. Aggregate findings from dev, staging, and prod into a single view.
 
@@ -595,7 +1219,7 @@ aws securityhub get-findings \
 
 ---
 
-## Challenge 5 — Capstone: RDS failover under load
+## Challenge 6 — Capstone: RDS failover under load
 
 **Goal:** Simulate a production database failure during peak load. Measure actual downtime. Verify it is under 60 seconds and the X-Ray trace captures the failure window.
 
@@ -703,7 +1327,7 @@ The trace shows exactly when the database connection dropped and when it recover
 
 ---
 
-## Challenge 6 — Cost analysis and optimization
+## Challenge 7 — Cost analysis and optimization
 
 **Goal:** Use AWS Cost Explorer to break down costs by account, service, and tag. Identify the top three cost drivers and propose one concrete reduction.
 
@@ -803,7 +1427,7 @@ This saves $0.81/day × 12 hours off = $0.40/day for part-time lab use.
 | Accidental `terraform destroy` | Destroys prod | Destroys only the target account |
 | IAM misconfiguration | Can affect all environments | Blast radius limited to one account |
 | Billing visibility | One bill, hard to attribute | Per-account bills with consolidated view |
-| Compliance | Harder to enforce prod guardrails | Control Tower SCPs apply per-OU |
+| Compliance | Harder to enforce prod guardrails | SCPs attached to OUs apply to every account below, including new ones |
 
 ---
 
@@ -834,7 +1458,7 @@ flowchart TD
 
 ## Outcome
 
-OrderFlow runs in three isolated AWS accounts deployed via a GitOps promotion pipeline. A code change reaches prod in under 10 minutes with a manual approval gate. GuardDuty and WAF are active in all three accounts. Security Hub aggregates findings from all accounts into the audit account. RDS failover completes in under 60 seconds.
+OrderFlow runs in three isolated AWS accounts governed by ten SCPs and deployed via a GitOps promotion pipeline. A code change reaches prod in under 10 minutes with a manual approval gate. Preventive controls block root activity, disable-logging attempts, and out-of-region deployments at the API layer. GuardDuty and WAF are active in all three accounts. Security Hub aggregates findings from all accounts into the audit account. RDS failover completes in under 60 seconds.
 
 ## Cost breakdown (free-tier optimised)
 
