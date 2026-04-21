@@ -36,7 +36,23 @@ postgres  | database system is ready to accept connections
 redis     | Ready to accept connections
 ```
 
-### Step 2: Verify the app is healthy
+### Step 2: Run the database migration
+
+The app does not auto-create tables on startup. Run the migration once after the first `docker compose up`:
+
+```bash
+docker compose exec app node src/migrate.js
+```
+
+Expected:
+```
+[migrate] Connecting to database...
+[migrate] Connected
+[migrate] Syncing schema...
+[migrate] Schema up to date
+```
+
+### Step 3: Verify the app is healthy
 
 ```bash
 curl http://localhost:3000/health
@@ -44,18 +60,27 @@ curl http://localhost:3000/health
 
 Expected response:
 ```json
-{ "status": "ok", "db": "connected", "redis": "connected" }
+{ "status": "ok", "db": "connected" }
 ```
 
-### Step 3: Register a user
+### Step 4: Register a user
 
 ```bash
 curl -s -X POST http://localhost:3000/auth/register \
   -H "Content-Type: application/json" \
-  -d '{"email": "test@orderflow.com", "password": "password123"}' | jq
+  -d '{"name": "Test User", "email": "test@orderflow.com", "password": "password123"}' | jq
 ```
 
-### Step 4: Log in and save the session cookie
+Expected response:
+```json
+{
+  "id": 1,
+  "name": "Test User",
+  "email": "test@orderflow.com"
+}
+```
+
+### Step 5: Log in and save the session cookie
 
 ```bash
 curl -s -c cookies.txt -X POST http://localhost:3000/auth/login \
@@ -65,7 +90,7 @@ curl -s -c cookies.txt -X POST http://localhost:3000/auth/login \
 
 The `-c cookies.txt` flag saves the session cookie to a file for reuse.
 
-### Step 5: Create a product
+### Step 6: Create a product
 
 ```bash
 curl -s -b cookies.txt -X POST http://localhost:3000/products \
@@ -75,7 +100,7 @@ curl -s -b cookies.txt -X POST http://localhost:3000/products \
 
 Note the `id` field in the response — you will need it in the next step.
 
-### Step 6: Place an order
+### Step 7: Place an order
 
 ```bash
 curl -s -b cookies.txt -X POST http://localhost:3000/orders \
@@ -94,7 +119,7 @@ Expected response:
 }
 ```
 
-### Step 7: List your orders
+### Step 8: List your orders
 
 ```bash
 curl -s -b cookies.txt http://localhost:3000/orders | jq

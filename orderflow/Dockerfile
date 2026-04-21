@@ -4,7 +4,8 @@ FROM node:20-alpine AS builder
 WORKDIR /app
 
 COPY package*.json ./
-RUN npm ci --only=production
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --omit=dev --fetch-timeout=300000
 
 # ── Runtime stage ─────────────────────────────────────────────────────────────
 FROM node:20-alpine
