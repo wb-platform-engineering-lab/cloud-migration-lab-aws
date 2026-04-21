@@ -12,6 +12,7 @@ const authRouter      = require('./routes/auth');
 const customersRouter = require('./routes/customers');
 const productsRouter  = require('./routes/products');
 const ordersRouter    = require('./routes/orders');
+const reportsRouter   = require('./routes/reports');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -52,6 +53,7 @@ app.use('/auth',      authRouter);
 app.use('/customers', customersRouter);
 app.use('/products',  productsRouter);
 app.use('/orders',    ordersRouter);
+app.use('/reports',   reportsRouter);
 
 // Health check
 // Used by the ALB health check in Phase 2 and ECS health check in Phase 3.
