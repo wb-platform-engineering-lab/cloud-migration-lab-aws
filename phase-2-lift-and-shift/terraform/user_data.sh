@@ -13,7 +13,7 @@ SECRET=$(aws secretsmanager get-secret-value \
   --output text)
 
 DB_USER=$(echo "$SECRET" | jq -r '.username')
-DB_PASS=$(echo "$SECRET" | jq -r '.password')
+DB_PASS=$(echo "$SECRET" | jq -r '.password' | python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.stdin.read().strip(), safe=''))")
 DB_NAME=$(echo "$SECRET" | jq -r '.dbname')
 
 # Resolve the RDS endpoint via AWS CLI (avoids hardcoding it in user-data)
