@@ -700,7 +700,7 @@ content-type: application/json
 ```bash
 curl -s -c cookies_alb.txt -X POST https://orderflow.yourdomain.com/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"email": "test@orderflow.com", "password": "password123"}' | jq
+  -d '{"email": "alice@example.com", "password": "password123"}' | jq
 ```
 
 ### Step 2: Place an order 10 times
