@@ -27,7 +27,6 @@ app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 app.use(express.static('public'));
 
 const redisClient = createClient({ url: process.env.REDIS_URL });
-redisClient.connect();
 
 app.use(session({
   store: new RedisStore({ client: redisClient }),
@@ -77,6 +76,9 @@ app.use((err, req, res, _next) => {
 
 async function start() {
   try {
+    await redisClient.connect();
+    console.log('[redis] Connected to Redis');
+
     await sequelize.authenticate();
     console.log('[db] Connected to PostgreSQL');
 
