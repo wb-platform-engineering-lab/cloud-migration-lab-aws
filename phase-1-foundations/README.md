@@ -1,6 +1,6 @@
 # Phase 1 — AWS Foundations
 
-> **AWS services introduced:** VPC, IAM, S3, DynamoDB | **Daily cost:** ~$2.20/day
+> **AWS services introduced:** VPC, IAM, S3, DynamoDB | **Daily cost:** ~$0.20/day
 
 ---
 
@@ -25,11 +25,11 @@ Every resource in this lab is created with Terraform. Never click in the console
 
 ```
 10.0.0.0/16
-├── Public subnets (10.0.1.0/24, 10.0.2.0/24)   — ALB, NAT gateway
+├── Public subnets (10.0.1.0/24, 10.0.2.0/24)   — ALB, NAT instance
 └── Private subnets (10.0.10.0/24, 10.0.11.0/24) — app servers, databases
 ```
 
-Public subnets hold load balancers and NAT gateways. Application servers and databases live in private subnets — nothing outside can reach them directly.
+Public subnets hold load balancers and the NAT instance. Application servers and databases live in private subnets — nothing outside can reach them directly.
 
 ---
 
@@ -264,35 +264,72 @@ Terraform has been successfully initialized!
 
 ---
 
-## Challenge 3 — Add a NAT gateway in each public subnet
+## Challenge 3 — Add a NAT instance in the public subnet
 
-NAT gateways allow resources in private subnets to initiate outbound connections to the internet (e.g., to pull Docker images) without being directly reachable from the internet.
+A NAT instance is an EC2 instance configured to forward traffic from private subnets to the internet. It serves the same purpose as a NAT gateway but costs ~95% less — making it ideal for labs and non-production environments.
 
-### Step 1: Add NAT gateway resources to `vpc.tf`
+> **NAT instance vs NAT gateway:** A NAT gateway is fully managed, highly available, and scales automatically — but costs $0.045/hour per gateway (~$1.08/day each). A NAT instance is a `t3.nano` EC2 instance ($0.0052/hour, ~$0.12/day) that you manage yourself. For a lab with a single AZ, a NAT instance is the right call.
+
+### Step 1: Add the NAT AMI data source and instance to `vpc.tf`
 
 Append the following to `vpc.tf`:
 
 ```hcl
-# Elastic IPs for the NAT gateways
-resource "aws_eip" "nat" {
-  count  = 2
-  domain = "vpc"
+# Look up the latest Amazon NAT instance AMI
+data "aws_ami" "nat_instance" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["amzn-ami-vpc-nat-*"]
+  }
+
+  filter {
+    name   = "architecture"
+    values = ["x86_64"]
+  }
+}
+
+# Security group — allow all inbound from the VPC, all outbound to the internet
+resource "aws_security_group" "nat" {
+  name        = "${var.project}-nat-sg"
+  vpc_id      = aws_vpc.main.id
+  description = "NAT instance — inbound from VPC, outbound to internet"
+
+  ingress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["10.0.0.0/16"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
 
   tags = {
-    Name        = "${var.project}-nat-eip-${count.index + 1}"
+    Name        = "${var.project}-nat-sg"
     Project     = var.project
     Environment = var.environment
   }
 }
 
-# NAT gateways — one per public subnet (one per AZ)
-resource "aws_nat_gateway" "main" {
-  count         = 2
-  allocation_id = aws_eip.nat[count.index].id
-  subnet_id     = aws_subnet.public[count.index].id
+# NAT instance — must live in a public subnet and have source/dest check disabled
+resource "aws_instance" "nat" {
+  ami                         = data.aws_ami.nat_instance.id
+  instance_type               = "t3.nano"
+  subnet_id                   = aws_subnet.public[0].id
+  associate_public_ip_address = true
+  source_dest_check           = false   # Required — NAT forwards packets for other hosts
+  vpc_security_group_ids      = [aws_security_group.nat.id]
+  iam_instance_profile        = aws_iam_instance_profile.ec2_instance.name
 
   tags = {
-    Name        = "${var.project}-nat-${count.index + 1}"
+    Name        = "${var.project}-nat"
     Project     = var.project
     Environment = var.environment
   }
@@ -300,14 +337,14 @@ resource "aws_nat_gateway" "main" {
   depends_on = [aws_internet_gateway.main]
 }
 
-# Route tables for private subnets — each routes through its AZ's NAT gateway
+# Route tables for private subnets — both route through the NAT instance
 resource "aws_route_table" "private" {
   count  = 2
   vpc_id = aws_vpc.main.id
 
   route {
-    cidr_block     = "0.0.0.0/0"
-    nat_gateway_id = aws_nat_gateway.main[count.index].id
+    cidr_block           = "0.0.0.0/0"
+    network_interface_id = aws_instance.nat.primary_network_interface_id
   }
 
   tags = {
@@ -324,7 +361,7 @@ resource "aws_route_table_association" "private" {
 }
 ```
 
-> **Cost note:** Each NAT gateway costs $0.045/hour + $0.045/GB processed. Two gateways = $2.16/day at idle. Always destroy when not working.
+> **Cost note:** One `t3.nano` NAT instance costs $0.0052/hour (~$0.12/day). This replaces two NAT gateways that would cost $2.16/day at idle — a 94% reduction for lab use.
 
 ---
 
@@ -393,7 +430,7 @@ terraform plan -out=tfplan
 Review the output carefully. You should see resources planned for creation:
 
 ```
-Plan: 18 to add, 0 to change, 0 to destroy.
+Plan: 16 to add, 0 to change, 0 to destroy.
 
   + aws_vpc.main
   + aws_subnet.public[0]
@@ -404,10 +441,8 @@ Plan: 18 to add, 0 to change, 0 to destroy.
   + aws_route_table.public
   + aws_route_table_association.public[0]
   + aws_route_table_association.public[1]
-  + aws_eip.nat[0]
-  + aws_eip.nat[1]
-  + aws_nat_gateway.main[0]
-  + aws_nat_gateway.main[1]
+  + aws_security_group.nat
+  + aws_instance.nat
   + aws_route_table.private[0]
   + aws_route_table.private[1]
   + aws_route_table_association.private[0]
@@ -421,8 +456,8 @@ Plan: 18 to add, 0 to change, 0 to destroy.
 
 - No resources should be modified or destroyed (this is a fresh deployment)
 - Every resource should have `Project` and `Environment` tags
-- NAT gateways should be in public subnets
-- Private route tables should reference NAT gateways, not the IGW
+- NAT instance should be in a public subnet with `source_dest_check = false`
+- Private route tables should reference the NAT instance's network interface, not the IGW
 
 ### Step 3: Apply
 
@@ -430,7 +465,7 @@ Plan: 18 to add, 0 to change, 0 to destroy.
 terraform apply tfplan
 ```
 
-NAT gateways take 1–2 minutes to become available. Wait for the apply to complete fully before moving on.
+The NAT instance is an EC2 instance — it typically becomes available in under 60 seconds. Wait for the apply to complete fully before moving on.
 
 ### Step 4: Verify the VPC in the AWS CLI
 
@@ -479,12 +514,12 @@ aws ec2 describe-vpcs \
   --output table
 ```
 
-### Step 2: Check tags on the NAT gateways
+### Step 2: Check tags on the NAT instance
 
 ```bash
-aws ec2 describe-nat-gateways \
-  --filter "Name=tag:Project,Values=orderflow" \
-  --query "NatGateways[*].{ID:NatGatewayId,State:State,Tags:Tags}" \
+aws ec2 describe-instances \
+  --filters "Name=tag:Project,Values=orderflow" "Name=tag:Name,Values=orderflow-nat" \
+  --query "Reservations[*].Instances[*].{ID:InstanceId,State:State.Name,Tags:Tags}" \
   --output table
 ```
 
@@ -528,11 +563,11 @@ A VPC with public/private subnets across 2 AZs, Terraform state in S3 with locki
 
 | Resource | $/day |
 |---|---|
-| 2× NAT Gateway | $2.16 |
+| 1× NAT instance (t3.nano) | ~$0.12 |
 | S3 + DynamoDB | ~$0.04 |
-| **Total** | **~$2.20** |
+| **Total** | **~$0.20** |
 
-> **Always destroy when done.** Two NAT gateways cost $1,620/year doing nothing.
+> **Always destroy when done.** Even at $0.20/day, leaving this running for a month adds up. NAT gateways would cost $1,620/year at idle — the NAT instance brings that down to ~$44/year.
 
 ```bash
 cd terraform && terraform destroy -auto-approve
