@@ -37,8 +37,9 @@ REDIS_URL=redis://${redis_endpoint}:6379
 SESSION_SECRET=$(openssl rand -hex 32)
 EOF
 
-# Run database migrations
+# Run database migrations and seed initial data
 npm run migrate
+npm run seed
 
 # Install as a systemd service
 cat > /etc/systemd/system/orderflow.service <<EOF
