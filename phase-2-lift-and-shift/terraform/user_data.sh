@@ -32,7 +32,7 @@ npm install --production
 cat > /app/phase-2-lift-and-shift/orderflow/.env <<EOF
 NODE_ENV=production
 PORT=3000
-DATABASE_URL=postgres://$DB_USER:$DB_PASS@$RDS_ENDPOINT:5432/$DB_NAME?sslmode=require
+DATABASE_URL=postgres://$DB_USER:$DB_PASS@$RDS_ENDPOINT:5432/$DB_NAME?sslmode=no-verify
 REDIS_URL=redis://${redis_endpoint}:6379
 SESSION_SECRET=$(openssl rand -hex 32)
 EOF
