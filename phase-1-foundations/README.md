@@ -275,19 +275,20 @@ A NAT instance is an EC2 instance configured to forward traffic from private sub
 Append the following to `vpc.tf`:
 
 ```hcl
-# Look up the latest Amazon NAT instance AMI
+# Look up the latest Amazon Linux 2 AMI
+# The old amzn-ami-vpc-nat-* AMIs are deprecated — AL2 with user_data is the modern approach
 data "aws_ami" "nat_instance" {
   most_recent = true
   owners      = ["amazon"]
 
   filter {
     name   = "name"
-    values = ["amzn-ami-vpc-nat-*"]
+    values = ["amzn2-ami-hvm-*-x86_64-gp2"]
   }
 
   filter {
-    name   = "architecture"
-    values = ["x86_64"]
+    name   = "state"
+    values = ["available"]
   }
 }
 
@@ -319,6 +320,8 @@ resource "aws_security_group" "nat" {
 }
 
 # NAT instance — must live in a public subnet and have source/dest check disabled
+# user_data enables IP forwarding and configures iptables masquerade (replaces the
+# deprecated amzn-ami-vpc-nat AMI which did this automatically at boot)
 resource "aws_instance" "nat" {
   ami                         = data.aws_ami.nat_instance.id
   instance_type               = "t3.nano"
@@ -327,6 +330,19 @@ resource "aws_instance" "nat" {
   source_dest_check           = false   # Required — NAT forwards packets for other hosts
   vpc_security_group_ids      = [aws_security_group.nat.id]
   iam_instance_profile        = aws_iam_instance_profile.ec2_instance.name
+
+  user_data = <<-EOF
+    #!/bin/bash
+    # Enable IP forwarding
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+    echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
+
+    # Masquerade outbound traffic on eth0 so private instances appear as the NAT IP
+    yum install -y iptables-services
+    iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+    service iptables save
+    systemctl enable iptables
+  EOF
 
   tags = {
     Name        = "${var.project}-nat"
