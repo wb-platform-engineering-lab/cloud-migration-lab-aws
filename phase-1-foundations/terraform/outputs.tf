@@ -14,8 +14,8 @@ output "private_subnet_ids" {
 }
 
 output "nat_instance_public_ip" {
-  description = "NAT instance Elastic IP (stable across reboots)"
-  value       = aws_eip.nat_instance.public_ip
+  description = "NAT instance public IP (assigned at launch)"
+  value       = aws_instance.nat.public_ip
 }
 
 output "ec2_instance_profile_name" {
