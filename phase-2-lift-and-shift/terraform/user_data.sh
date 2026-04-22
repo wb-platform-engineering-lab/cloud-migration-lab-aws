@@ -24,12 +24,12 @@ RDS_ENDPOINT=$(aws rds describe-db-instances \
   --output text)
 
 # Clone the application
-git clone https://github.com/your-org/cloud-migration-lab-aws /app
-cd /app/orderflow
+git clone https://github.com/wb-platform-engineering-lab/cloud-migration-lab-aws.git /app
+cd /app/phase-2-lift-and-shift/orderflow
 npm install --production
 
 # Write the environment file
-cat > /app/orderflow/.env <<EOF
+cat > /app/phase-2-lift-and-shift/orderflow/.env <<EOF
 NODE_ENV=production
 PORT=3000
 DATABASE_URL=postgres://$DB_USER:$DB_PASS@$RDS_ENDPOINT:5432/$DB_NAME
@@ -47,8 +47,8 @@ Description=OrderFlow
 After=network.target
 
 [Service]
-WorkingDirectory=/app/orderflow
-EnvironmentFile=/app/orderflow/.env
+WorkingDirectory=/app/phase-2-lift-and-shift/orderflow
+EnvironmentFile=/app/phase-2-lift-and-shift/orderflow/.env
 ExecStart=/usr/bin/node src/app.js
 Restart=always
 RestartSec=5

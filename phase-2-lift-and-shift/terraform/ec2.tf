@@ -15,8 +15,7 @@ resource "aws_launch_template" "app" {
   user_data = local.user_data
 
   iam_instance_profile {
-    # Instance profile created in Phase 1
-    name = "${var.project}-ec2-instance-profile"
+    name = aws_iam_instance_profile.app.name
   }
 
   network_interfaces {

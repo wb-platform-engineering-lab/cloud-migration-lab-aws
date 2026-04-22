@@ -1,42 +1,31 @@
-# NAT Instance — free-tier t2.micro replacing the $2.16/day NAT Gateway pair.
-#
-# Trade-offs vs NAT Gateway:
-#   - Single point of failure per VPC (no per-AZ redundancy)
-#   - Max throughput ~1 Gbps vs NAT Gateway's elastic scaling
-#   - Requires manual patching
-# These are acceptable for a dev/lab environment.
-# For production, switch back to aws_nat_gateway resources.
-
-# AWS-maintained AMI: Amazon Linux 2 pre-configured for IP forwarding and NAT masquerade
+# Look up the latest Amazon Linux 2 AMI
+# The old amzn-ami-vpc-nat-* AMIs are deprecated — AL2 with user_data is the modern approach
 data "aws_ami" "nat_instance" {
   most_recent = true
   owners      = ["amazon"]
 
   filter {
     name   = "name"
-    values = ["amzn-ami-vpc-nat-*"]
+    values = ["amzn2-ami-hvm-*-x86_64-gp2"]
   }
 
   filter {
-    name   = "architecture"
-    values = ["x86_64"]
+    name   = "state"
+    values = ["available"]
   }
 }
 
-resource "aws_security_group" "nat_instance" {
-  name        = "${var.project}-nat-instance-sg"
-  description = "NAT instance — allows private subnets outbound internet access"
+# Security group — allow all inbound from the VPC, all outbound to the internet
+resource "aws_security_group" "nat" {
+  name        = "${var.project}-nat-sg"
   vpc_id      = aws_vpc.main.id
+  description = "NAT instance - inbound from VPC, outbound to internet"
 
   ingress {
-    description = "All traffic from private subnets"
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
-    cidr_blocks = [
-      aws_subnet.private[0].cidr_block,
-      aws_subnet.private[1].cidr_block,
-    ]
+    cidr_blocks = ["10.10.0.0/16"]
   }
 
   egress {
@@ -47,39 +36,47 @@ resource "aws_security_group" "nat_instance" {
   }
 
   tags = {
-    Name = "${var.project}-nat-instance-sg"
+    Name        = "${var.project}-nat-sg"
+    Project     = var.project
+    Environment = var.environment
   }
 }
 
-# t2.micro: free tier eligible — 750 hrs/month for first 12 months
+# NAT instance — must live in a public subnet and have source/dest check disabled
+# user_data enables IP forwarding and configures iptables masquerade (replaces the
+# deprecated amzn-ami-vpc-nat AMI which did this automatically at boot)
 resource "aws_instance" "nat" {
   ami                         = data.aws_ami.nat_instance.id
-  instance_type               = "t2.micro"
+  instance_type               = "t3.nano"
   subnet_id                   = aws_subnet.public[0].id
-  vpc_security_group_ids      = [aws_security_group.nat_instance.id]
-  source_dest_check           = false # Must be disabled — NAT forwards packets between subnets
   associate_public_ip_address = true
+  source_dest_check           = false   # Required — NAT forwards packets for other hosts
+  vpc_security_group_ids      = [aws_security_group.nat.id]
+  iam_instance_profile        = aws_iam_instance_profile.ec2_instance.name
 
-  iam_instance_profile = aws_iam_instance_profile.ec2_instance.name
+  user_data = <<-EOF
+    #!/bin/bash
+    # Enable IP forwarding
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+    echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
+
+    # Masquerade outbound traffic on eth0 so private instances appear as the NAT IP
+    yum install -y iptables-services
+    iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+    service iptables save
+    systemctl enable iptables
+  EOF
 
   tags = {
-    Name = "${var.project}-nat-instance"
+    Name        = "${var.project}-nat"
+    Project     = var.project
+    Environment = var.environment
   }
-}
-
-# Elastic IP — keeps the NAT instance at a stable public IP across reboots
-resource "aws_eip" "nat_instance" {
-  domain   = "vpc"
-  instance = aws_instance.nat.id
 
   depends_on = [aws_internet_gateway.main]
-
-  tags = {
-    Name = "${var.project}-nat-instance-eip"
-  }
 }
 
-# Private route tables — both private subnets route outbound through the NAT instance ENI
+# Route tables for private subnets — both route through the NAT instance
 resource "aws_route_table" "private" {
   count  = 2
   vpc_id = aws_vpc.main.id
@@ -90,7 +87,9 @@ resource "aws_route_table" "private" {
   }
 
   tags = {
-    Name = "${var.project}-private-rt-${count.index + 1}"
+    Name        = "${var.project}-private-rt-${count.index + 1}"
+    Project     = var.project
+    Environment = var.environment
   }
 }
 

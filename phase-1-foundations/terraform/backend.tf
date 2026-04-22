@@ -11,7 +11,7 @@ terraform {
   backend "s3" {
     # Replace REPLACE_WITH_ACCOUNT_ID with your AWS account ID
     # e.g. bucket = "orderflow-tfstate-123456789012"
-    bucket         = "orderflow-tfstate-REPLACE_WITH_ACCOUNT_ID"
+    bucket         = "orderflow-tfstate-667879771254"
     key            = "phase-1/terraform.tfstate"
     region         = "us-east-1"
     dynamodb_table = "orderflow-tfstate-lock"
