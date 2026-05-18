@@ -300,22 +300,44 @@ However, to demonstrate reading directly from Secrets Manager at startup (the pa
 
 ### Step 1: Store the connection details as a secret
 
+Pull the endpoints from Phase 2 terraform outputs. The DB password is stored in Secrets Manager as JSON — extract it and URL-encode it before embedding in the connection string (the generated password contains characters like `?`, `=`, `!` that break URL parsing).
+
 ```bash
-# Store DATABASE_URL as a secret
+cd phase-2-lift-and-shift/terraform
+
+RDS_HOST=$(terraform output -raw db_instance_endpoint | cut -d: -f1)
+REDIS_HOST=$(terraform output -raw redis_endpoint)
+
+# Extract the DB password from the existing Phase 2 secret
+DB_PASS=$(aws secretsmanager get-secret-value \
+  --region us-east-1 \
+  --secret-id "orderflow/db-password" \
+  --query SecretString --output text \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['password'])")
+
+# URL-encode the password — special chars like ?, =, ! break the connection URL
+ENCODED_PASS=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote('${DB_PASS}', safe=''))")
+
+# Store DATABASE_URL
 aws secretsmanager create-secret \
+  --region us-east-1 \
   --name "orderflow/database-url" \
-  --secret-string "postgres://orderflow:<PASSWORD>@<RDS_ENDPOINT>:5432/orderflow"
+  --secret-string "postgres://orderflow:${ENCODED_PASS}@${RDS_HOST}/orderflow?sslmode=no-verify"
 
 # Store REDIS_URL
 aws secretsmanager create-secret \
+  --region us-east-1 \
   --name "orderflow/redis-url" \
-  --secret-string "redis://<ELASTICACHE_ENDPOINT>:6379"
+  --secret-string "redis://${REDIS_HOST}:6379"
 
 # Store SESSION_SECRET
 aws secretsmanager create-secret \
+  --region us-east-1 \
   --name "orderflow/session-secret" \
   --secret-string "$(openssl rand -hex 32)"
 ```
+
+> **Why URL-encode?** A connection string is a URL. If the password contains `?`, the driver treats everything after it as query parameters. Characters like `=`, `!`, and `*` cause similar parsing failures. Always URL-encode passwords before embedding them in connection strings.
 
 ### Step 2: Verify the task execution role can read the secrets
 
@@ -333,16 +355,85 @@ The secret value is injected into the container as `DATABASE_URL` at launch. The
 
 ## Challenge 4 — Create the ECS Service and wire it to the ALB target group
 
-### Step 1: Add the ECS service security group to `security_groups.tf`
+### Step 1: Create a dedicated ECS target group in `alb.tf`
+
+The Phase 2 target group uses `target_type = "instance"` for the EC2 ASG. Fargate with `awsvpc` network mode requires `target_type = "ip"` — you cannot share the same target group. Create a new one and attach it to the ALB HTTP listener.
 
 ```hcl
-# Reuse the app security group from Phase 2 — ECS tasks use the same rules
-# (accept traffic from ALB on port 3000, egress unrestricted)
+# alb.tf
+
+resource "aws_lb_target_group" "ecs" {
+  name        = "${var.project}-ecs-tg"
+  port        = 3000
+  protocol    = "HTTP"
+  vpc_id      = data.aws_vpc.main.id
+  target_type = "ip" # Required for Fargate awsvpc network mode
+
+  health_check {
+    path                = "/health"
+    protocol            = "HTTP"
+    matcher             = "200"
+    interval            = 30
+    timeout             = 5
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+  }
+
+  tags = { Name = "${var.project}-ecs-tg" }
+}
+
+# Forward all traffic from the HTTP listener to the ECS target group
+resource "aws_lb_listener_rule" "ecs_http" {
+  listener_arn = data.aws_lb_listener.http.arn
+  priority     = 10
+
+  action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.ecs.arn
+  }
+
+  condition {
+    path_pattern {
+      values = ["/*"]
+    }
+  }
+}
 ```
 
-The Phase 2 `app` security group already covers ECS tasks — no change needed.
+Add the listener data source to `data.tf`:
 
-### Step 2: Create the ECS service in `ecs.tf`
+```hcl
+data "aws_lb_listener" "http" {
+  load_balancer_arn = data.aws_lb.main.arn
+  port              = 80
+}
+```
+
+### Step 2: Allow ECS tasks to reach RDS and Redis
+
+The Phase 2 RDS and Redis security groups only allow inbound traffic from the EC2 ASG security group. ECS tasks use a separate security group — add it to both:
+
+```bash
+ECS_SG=$(aws ec2 describe-security-groups \
+  --filters "Name=group-name,Values=orderflow-ecs-tasks-sg" \
+  --query "SecurityGroups[0].GroupId" --output text)
+
+RDS_SG=$(aws ec2 describe-security-groups \
+  --filters "Name=group-name,Values=orderflow-rds-sg" \
+  --query "SecurityGroups[0].GroupId" --output text)
+
+REDIS_SG=$(aws ec2 describe-security-groups \
+  --filters "Name=group-name,Values=orderflow-redis-sg" \
+  --query "SecurityGroups[0].GroupId" --output text)
+
+aws ec2 authorize-security-group-ingress \
+  --group-id $RDS_SG --protocol tcp --port 5432 --source-group $ECS_SG
+
+aws ec2 authorize-security-group-ingress \
+  --group-id $REDIS_SG --protocol tcp --port 6379 --source-group $ECS_SG
+```
+
+### Step 3: Create the ECS service in `ecs.tf`
 
 Append to `ecs.tf`:
 
@@ -360,18 +451,17 @@ resource "aws_ecs_service" "orderflow" {
 
   network_configuration {
     subnets          = data.aws_subnets.private.ids
-    security_groups  = [data.aws_security_group.app.id]
+    security_groups  = [aws_security_group.ecs_tasks.id]
     assign_public_ip = false
   }
 
   load_balancer {
-    target_group_arn = data.aws_lb_target_group.app.arn
+    target_group_arn = aws_lb_target_group.ecs.arn
     container_name   = "orderflow"
     container_port   = 3000
   }
 
-  # Ensure the ALB listener exists before creating the service
-  depends_on = [data.aws_lb_target_group.app]
+  depends_on = [aws_lb_listener_rule.ecs_http]
 
   tags = { Project = var.project }
 }
@@ -427,8 +517,16 @@ aws autoscaling update-auto-scaling-group \
   --desired-capacity 0
 
 echo "Waiting for instances to terminate..."
-aws autoscaling wait group-in-service \
-  --auto-scaling-group-name orderflow-asg
+# Note: 'aws autoscaling wait group-in-service' was removed in AWS CLI v2.
+# Poll until no instances remain:
+until [ "$(aws autoscaling describe-auto-scaling-groups \
+  --auto-scaling-group-names orderflow-asg \
+  --query 'AutoScalingGroups[0].Instances' \
+  --output text)" = "" ]; do
+  echo "Instances still terminating..."
+  sleep 10
+done
+echo "All instances terminated"
 ```
 
 Then remove the ASG and launch template from Phase 2 Terraform state:

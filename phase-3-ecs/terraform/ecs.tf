@@ -7,7 +7,7 @@ resource "aws_security_group" "ecs_tasks" {
     from_port       = 3000
     to_port         = 3000
     protocol        = "tcp"
-    security_groups = [data.aws_lb.main.security_groups[0]]
+    security_groups = data.aws_lb.main.security_groups
   }
 
   egress {
@@ -62,10 +62,11 @@ resource "aws_ecs_task_definition" "orderflow" {
       { name = "PORT", value = "3000" },
     ]
 
-    secrets = [{
-      name      = "DATABASE_CREDENTIALS"
-      valueFrom = data.aws_secretsmanager_secret.db_password.arn
-    }]
+    secrets = [
+      { name = "DATABASE_URL",    valueFrom = data.aws_secretsmanager_secret.database_url.arn },
+      { name = "REDIS_URL",       valueFrom = data.aws_secretsmanager_secret.redis_url.arn },
+      { name = "SESSION_SECRET",  valueFrom = data.aws_secretsmanager_secret.session_secret.arn },
+    ]
 
     logConfiguration = {
       logDriver = "awslogs"
@@ -79,11 +80,15 @@ resource "aws_ecs_task_definition" "orderflow" {
 }
 
 resource "aws_ecs_service" "orderflow" {
-  name            = var.project
+  name            = "orderflow"
   cluster         = aws_ecs_cluster.main.id
   task_definition = aws_ecs_task_definition.orderflow.arn
-  desired_count   = 1 # 1 task to minimise cost; set to 2 for HA testing
+  desired_count   = 2
   launch_type     = "FARGATE"
+
+  # Rolling deployment — ECS starts new tasks before stopping old ones
+  deployment_minimum_healthy_percent = 50
+  deployment_maximum_percent         = 200
 
   network_configuration {
     subnets          = data.aws_subnets.private.ids
@@ -92,16 +97,12 @@ resource "aws_ecs_service" "orderflow" {
   }
 
   load_balancer {
-    target_group_arn = data.aws_lb_target_group.app.arn
+    target_group_arn = aws_lb_target_group.ecs.arn
     container_name   = "orderflow"
     container_port   = 3000
   }
 
-  deployment_minimum_healthy_percent = 50
-  deployment_maximum_percent         = 200
+  depends_on = [aws_lb_listener_rule.ecs_http]
 
-  lifecycle {
-    # task_definition is updated by CI/CD after each image push
-    ignore_changes = [task_definition]
-  }
+  tags = { Project = var.project }
 }

@@ -20,16 +20,25 @@ data "aws_subnets" "public" {
   tags = { Tier = "public" }
 }
 
-# Reference Phase 2 ALB target group to attach the ECS service
+# Reference Phase 2 ALB
 data "aws_lb" "main" {
   tags = { Name = "${var.project}-alb" }
 }
 
-data "aws_lb_target_group" "app" {
-  name = "${var.project}-tg"
+# Reference Phase 2 HTTP listener to attach a forwarding rule for ECS
+data "aws_lb_listener" "http" {
+  load_balancer_arn = data.aws_lb.main.arn
+  port              = 80
 }
 
-# RDS secret ARN from Phase 2
-data "aws_secretsmanager_secret" "db_password" {
-  name = "${var.project}/db-password"
+data "aws_secretsmanager_secret" "database_url" {
+  name = "${var.project}/database-url"
+}
+
+data "aws_secretsmanager_secret" "redis_url" {
+  name = "${var.project}/redis-url"
+}
+
+data "aws_secretsmanager_secret" "session_secret" {
+  name = "${var.project}/session-secret"
 }
