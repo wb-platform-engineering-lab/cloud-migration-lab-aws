@@ -9,7 +9,7 @@ terraform {
   }
 
   backend "s3" {
-    bucket         = "orderflow-tfstate-REPLACE_WITH_ACCOUNT_ID"
+    bucket         = "orderflow-tfstate-667879771254"
     key            = "phase-3/terraform.tfstate"
     region         = "us-east-1"
     dynamodb_table = "orderflow-tfstate-lock"

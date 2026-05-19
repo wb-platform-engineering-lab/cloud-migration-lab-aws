@@ -15,3 +15,9 @@ variable "environment" {
   type        = string
   default     = "dev"
 }
+
+variable "domain" {
+  description = "Base domain name for Route 53 (e.g. example.com). Leave empty to skip DNS/ACM setup."
+  type        = string
+  default     = ""
+}
