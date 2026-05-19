@@ -32,5 +32,11 @@
   },
   "engines": {
     "node": ">=20"
+  },
+  "overrides": {
+    "cross-spawn": "^7.0.5",
+    "glob": "^10.5.0",
+    "minimatch": "^10.0.0",
+    "tar": "^7.5.11"
   }
 }
