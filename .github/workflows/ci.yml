@@ -124,6 +124,8 @@ jobs:
           exit-code: '1'
           severity: 'CRITICAL,HIGH'
           ignore-unfixed: true
+          # Skip npm/yarn bundled into the base image — we can't control those versions
+          skip-dirs: '/usr/local/lib/node_modules/npm,/opt/yarn-v1.22.22'
 
       - name: Push to ECR
         run: |
