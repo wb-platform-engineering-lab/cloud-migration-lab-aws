@@ -1,0 +1,212 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  id-token: write   # Required for OIDC
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPO: orderflow
+  ECS_CLUSTER: orderflow
+  ECS_SERVICE: orderflow
+
+jobs:
+  # ── Job 1: Lint ──────────────────────────────────────────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: orderflow
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: orderflow/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: ESLint
+        run: npm run lint
+
+      - name: Lint Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: orderflow/Dockerfile
+          failure-threshold: warning
+
+  # ── Job 2: Test ──────────────────────────────────────────────────────────────
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: orderflow
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: orderflow/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+  # ── Job 3: Build + Scan + Push ───────────────────────────────────────────────
+  build-scan-push:
+    name: Build → Scan → Push
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    # Only push on main branch pushes, not PRs
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    outputs:
+      image-uri: ${{ steps.meta.outputs.image-uri }}
+      image-sha: ${{ steps.meta.outputs.sha }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image metadata
+        id: meta
+        run: |
+          REGISTRY=${{ steps.ecr-login.outputs.registry }}
+          SHA=${GITHUB_SHA::8}
+          echo "image-uri=${REGISTRY}/${{ env.ECR_REPO }}:${SHA}" >> "$GITHUB_OUTPUT"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (linux/amd64)
+        uses: docker/build-push-action@v5
+        with:
+          context: orderflow
+          platforms: linux/amd64
+          push: false          # Don't push yet — scan first
+          tags: ${{ steps.meta.outputs.image-uri }}
+          load: true           # Load into local Docker daemon for Trivy
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.meta.outputs.image-uri }}
+          format: table
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+
+      - name: Push to ECR
+        run: |
+          REGISTRY=${{ steps.ecr-login.outputs.registry }}
+          SHA=${{ steps.meta.outputs.sha }}
+          docker push ${REGISTRY}/${{ env.ECR_REPO }}:${SHA}
+          docker tag  ${REGISTRY}/${{ env.ECR_REPO }}:${SHA} \
+                      ${REGISTRY}/${{ env.ECR_REPO }}:latest
+          docker push ${REGISTRY}/${{ env.ECR_REPO }}:latest
+          echo "Pushed: ${REGISTRY}/${{ env.ECR_REPO }}:${SHA}"
+
+  # ── Job 4: Deploy to ECS ─────────────────────────────────────────────────────
+  deploy:
+    name: Deploy to ECS
+    runs-on: ubuntu-latest
+    needs: build-scan-push
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Resolve full image URI
+        id: image
+        run: |
+          REGISTRY=${{ steps.ecr-login.outputs.registry }}
+          SHA=${{ needs.build-scan-push.outputs.image-sha }}
+          echo "uri=${REGISTRY}/${{ env.ECR_REPO }}:${SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Get current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.ECS_SERVICE }} \
+            --query taskDefinition \
+            > task-def.json
+
+      - name: Update image in task definition
+        run: |
+          jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                  .placementConstraints, .compatibilities, .registeredAt,
+                  .registeredBy, .deregisteredAt)
+             | .containerDefinitions[0].image = "${{ steps.image.outputs.uri }}"' \
+            task-def.json > new-task-def.json
+
+          cat new-task-def.json | jq '.containerDefinitions[0].image'
+
+      - name: Register new task definition revision
+        id: register
+        run: |
+          NEW_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://new-task-def.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          echo "Registered: $NEW_ARN"
+          echo "arn=$NEW_ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Update ECS service
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service  ${{ env.ECS_SERVICE }} \
+            --task-definition ${{ steps.register.outputs.arn }} \
+            --force-new-deployment
+
+      - name: Wait for service stability
+        run: |
+          echo "Waiting for service to stabilize (up to 10 minutes)..."
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }}
+          echo "Deployment stable!"
+
+      - name: Verify deployment
+        run: |
+          aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }} \
+            --query 'services[0].{running:runningCount,desired:desiredCount,status:status,taskDef:taskDefinition}' \
+            --output table

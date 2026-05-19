@@ -7,7 +7,9 @@
     "start": "node src/app.js",
     "dev": "nodemon src/app.js",
     "migrate": "node src/migrate.js",
-    "seed": "node src/seed.js"
+    "seed": "node src/seed.js",
+    "lint": "eslint src/",
+    "test": "jest --forceExit"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
@@ -24,6 +26,8 @@
     "sequelize": "^6.35.0"
   },
   "devDependencies": {
+    "eslint": "^8.57.1",
+    "jest": "^30.4.2",
     "nodemon": "^3.0.2"
   },
   "engines": {

@@ -141,4 +141,4 @@ function renderPDF(stats, orders) {
   return Buffer.concat(buffers);
 }
 
-module.exports = { generateDailyReport };
+module.exports = { generateDailyReport, burnCpu };

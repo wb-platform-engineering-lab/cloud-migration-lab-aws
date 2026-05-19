@@ -1,0 +1,101 @@
+name: Promote to Staging
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_sha:
+        description: 'Image SHA to promote (8-char short SHA, e.g. a1b2c3d4)'
+        required: true
+        type: string
+      confirm:
+        description: 'Type "yes" to confirm promotion'
+        required: true
+        default: 'no'
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPO: orderflow
+  ECS_CLUSTER: orderflow
+  ECS_SERVICE: orderflow-staging
+
+jobs:
+  gate:
+    name: Safety gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require confirmation
+        if: inputs.confirm != 'yes'
+        run: |
+          echo "::error::You must type 'yes' in the confirm field to proceed."
+          exit 1
+
+  promote:
+    name: Promote ${{ inputs.image_sha }} to staging
+    runs-on: ubuntu-latest
+    needs: gate
+
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Verify the image exists in ECR
+        run: |
+          REGISTRY=${{ steps.ecr-login.outputs.registry }}
+          IMAGE="${REGISTRY}/${{ env.ECR_REPO }}:${{ inputs.image_sha }}"
+          echo "Verifying image: $IMAGE"
+          aws ecr describe-images \
+            --repository-name ${{ env.ECR_REPO }} \
+            --image-ids imageTag=${{ inputs.image_sha }} \
+            --query 'imageDetails[0].{tag:imageTags[0],pushed:imagePushedAt,size:imageSizeInBytes}' \
+            --output table
+
+      - name: Get current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.ECS_SERVICE }} \
+            --query taskDefinition \
+            > task-def.json
+
+      - name: Update image SHA in task definition
+        run: |
+          REGISTRY=${{ steps.ecr-login.outputs.registry }}
+          IMAGE="${REGISTRY}/${{ env.ECR_REPO }}:${{ inputs.image_sha }}"
+          jq --arg img "$IMAGE" \
+            'del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                 .placementConstraints, .compatibilities, .registeredAt,
+                 .registeredBy, .deregisteredAt)
+            | .containerDefinitions[0].image = $img' \
+            task-def.json > new-task-def.json
+          echo "Promoting image: $IMAGE"
+
+      - name: Register and deploy
+        run: |
+          NEW_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://new-task-def.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service  ${{ env.ECS_SERVICE }} \
+            --task-definition $NEW_ARN \
+            --force-new-deployment
+
+          echo "Waiting for stability..."
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }}
+
+          echo "Promoted ${{ inputs.image_sha }} to staging!"
